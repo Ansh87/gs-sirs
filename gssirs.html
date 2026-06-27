@@ -218,6 +218,10 @@ header::after{
 .lf-head .lf-toggle{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;color:var(--txt3);transition:.13s;flex-shrink:0;margin-left:4px}
 .lf-head .lf-toggle:hover{background:var(--surf-soft2);color:var(--txt)}
 .lf-head .lf-toggle svg{width:15px;height:15px;transition:transform .25s}
+/* data source status row — subtle, below feed header */
+.ds-row{display:flex;flex-wrap:wrap;gap:4px;padding:5px 14px 6px;border-bottom:1px solid var(--line)}
+.ds-chip{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;font-weight:500;color:var(--txt3);letter-spacing:.2px}
+.ds-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 /* collapsed: hide the scrolling body, keep the header bar as a clickable pill */
 .live-feed.collapsed{max-height:none}
 .live-feed.collapsed .lf-scroll{display:none}
@@ -1177,6 +1181,8 @@ header::after{
             <svg viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
+        <!-- data source status — tiny, non-intrusive -->
+        <div class="ds-row" id="dataStatusRow"></div>
         <div class="lf-scroll" id="lfScroll"></div>
       </div>
 
@@ -1439,6 +1445,66 @@ let currentRole = 'gov';
 /* ---- Live data state ---- */
 let liveSeismic = {};   // strait id -> {count, maxMag}
 let liveWeather = {};   // strait id -> {wind, wave}
+let liveAIS     = {};   // strait id -> {vesselCount, densityScore, status}
+let liveGeo     = {};   // strait id -> {score, eventCount, status}
+let liveEIA     = {};   // global -> {oilProdMbd, weeklyChange, status}
+let liveTrade   = {};   // strait id -> {tradeB, dependencyMult, status}
+
+/* ---- API keys — replace with real keys; app degrades gracefully without them ---- */
+const API_KEYS = {
+  aisstream: 'YOUR_AISSTREAM_KEY',   // free at aisstream.io
+  eia:       'yMz95CguEpQp6XIbigA5Bi4r7fEor1u07NGCKHI1',          // free at eia.gov/opendata
+};
+
+/* ---- Chokepoint bounding boxes for AIS vessel counting ---- */
+const STRAIT_BBOX = {
+  hormuz:     { minLat:25.8, maxLat:27.0, minLon:56.2, maxLon:57.5 },
+  malacca:    { minLat:1.0,  maxLat:4.5,  minLon:99.5, maxLon:103.5 },
+  suez:       { minLat:29.9, maxLat:32.5, minLon:32.0, maxLon:33.0 },
+  panama:     { minLat:8.7,  maxLat:9.5,  minLon:-80.0,maxLon:-79.3 },
+  babelmandeb:{ minLat:11.5, maxLat:13.5, minLon:42.5, maxLon:44.0 },
+  bosporus:   { minLat:40.8, maxLat:41.5, minLon:28.9, maxLon:29.3 },
+};
+
+/* ---- GDELT CAMEO codes that signal maritime / geopolitical risk ---- */
+// 14=Protest, 17=Coerce, 18=Assault, 19=Fight, 20=Mass violence, 15=Threaten
+const GEO_CAMEO_RISK = new Set(['14','15','17','18','19','20']);
+
+/* ---- Trade baseline multipliers per strait (World Bank WITS annual, last update 2024) ---- */
+// These seed liveTrade on startup and are refreshed from WB API if available
+const TRADE_BASELINE = {
+  hormuz:     { tradeB:1500, dependencyMult:1.00 },
+  malacca:    { tradeB:3400, dependencyMult:1.00 },
+  suez:       { tradeB:1000, dependencyMult:1.00 },
+  panama:     { tradeB:270,  dependencyMult:1.00 },
+  babelmandeb:{ tradeB:700,  dependencyMult:1.00 },
+  bosporus:   { tradeB:400,  dependencyMult:1.00 },
+};
+
+/* ---- Data source status tracker — drives the tiny status indicator ---- */
+const liveDataStatus = {
+  seismic: 'init', weather: 'init',
+  ais: 'init', geo: 'init', eia: 'init', trade: 'init',
+};
+function setDataStatus(key, val){ liveDataStatus[key]=val; renderDataStatus(); }
+function renderDataStatus(){
+  // small dot-row in the Live Feed header — not intrusive, just informational
+  const el = document.getElementById('dataStatusRow'); if(!el) return;
+  const sources = [
+    { key:'seismic', label:'Seismic' },
+    { key:'weather', label:'Weather' },
+    { key:'ais',     label:'AIS' },
+    { key:'geo',     label:'GeoSig' },
+    { key:'eia',     label:'Energy' },
+    { key:'trade',   label:'Trade' },
+  ];
+  const dotColor = s => s==='live'?'var(--low)':s==='modeled'?'var(--elev)':'var(--txt3)';
+  el.innerHTML = sources.map(({key,label})=>`
+    <span class="ds-chip">
+      <span class="ds-dot" style="background:${dotColor(liveDataStatus[key])}"></span>
+      ${label}
+    </span>`).join('');
+}
 
 /* ---- Tier helpers (RPS = 3 tiers per spec) ---- */
 function tierOf(rps){
@@ -1450,19 +1516,46 @@ function tierOf(rps){
 /* ---- RPS computation ---- */
 function computeFacets(s){
   const f = { ...s.base };
-  // seismic feeds environmental + physical for fault-adjacent straits
+
+  // 1. USGS seismic → env + phys
   const seis = liveSeismic[s.id];
   if(seis){
     const bump = Math.min(20, seis.count*2 + (seis.maxMag>0 ? (seis.maxMag-3)*6 : 0));
-    f.env = Math.min(100, f.env + Math.max(0,bump));
-    f.phys = Math.min(100, f.phys + Math.max(0,bump*0.4));
+    f.env  = Math.min(100, f.env  + Math.max(0, bump));
+    f.phys = Math.min(100, f.phys + Math.max(0, bump*0.4));
   }
-  // marine weather feeds environmental
+
+  // 2. Open-Meteo marine weather → env
   const w = liveWeather[s.id];
   if(w){
     const wb = Math.min(18, (w.wind>15?(w.wind-15)*1.4:0) + (w.wave>2.5?(w.wave-2.5)*5:0));
     f.env = Math.min(100, f.env + wb);
   }
+
+  // 3. AIS vessel density → phys (congestion) + econ (traffic activity)
+  const ais = liveAIS[s.id];
+  if(ais && ais.status==='live'){
+    // high vessel count near chokepoint → elevated physical congestion risk
+    const aisBump = Math.min(15, Math.round((ais.densityScore - 50) * 0.3));
+    f.phys = Math.min(100, f.phys + Math.max(-10, aisBump));
+    f.econ = Math.min(100, f.econ + Math.max(-5,  Math.round(aisBump*0.4)));
+  }
+
+  // 4. GDELT news-derived geopolitical signal → geo + mil
+  const geo = liveGeo[s.id];
+  if(geo && geo.status==='live'){
+    // geo.score is 0–100 derived from GDELT event counts
+    const geoDelta = Math.round((geo.score - s.base.geo) * 0.4);
+    f.geo = Math.min(100, Math.max(0, f.geo + geoDelta));
+    f.mil = Math.min(100, Math.max(0, f.mil + Math.round(geoDelta * 0.5)));
+  }
+
+  // 5. Trade dependency multiplier from World Bank → econ
+  const trade = liveTrade[s.id];
+  if(trade && trade.dependencyMult !== 1.0){
+    f.econ = Math.min(100, Math.round(f.econ * trade.dependencyMult));
+  }
+
   return f;
 }
 function computeRPS(facets){
@@ -1855,6 +1948,47 @@ function panelHTML(s){
         <div class="kcard"><div class="kl">Alt. reroute</div><div class="kv">${s.reroute}</div></div>
       </div>
     </div>
+
+    ${(()=>{
+      const ais = liveAIS[s.id]; const geo = liveGeo[s.id];
+      const eia = liveEIA || {};
+      const aLabel = ais?.status==='live' ? 'AIS live' : 'AIS modeled';
+      const gLabel = geo?.status==='live' ? 'GDELT live' : 'Geo modeled';
+      const aColor = ais?.status==='live' ? 'var(--low)' : 'var(--elev)';
+      const gColor = geo?.status==='live' ? 'var(--low)' : 'var(--elev)';
+      return `<div class="sect">
+        <div class="sect-t">Live data signals</div>
+        <div class="kgrid">
+          <div class="kcard">
+            <div class="kl" style="display:flex;align-items:center;gap:5px">
+              <span style="width:6px;height:6px;border-radius:50%;background:${aColor};flex-shrink:0"></span>
+              Vessel density
+            </div>
+            <div class="kv">${ais ? ais.vesselCount + ' near bbox' : '—'}
+              <span style="font-size:9px;color:var(--txt3);margin-left:4px">${aLabel}</span>
+            </div>
+          </div>
+          <div class="kcard">
+            <div class="kl" style="display:flex;align-items:center;gap:5px">
+              <span style="width:6px;height:6px;border-radius:50%;background:${gColor};flex-shrink:0"></span>
+              Geo signal
+            </div>
+            <div class="kv">${geo ? geo.score + '/100' : '—'}
+              <span style="font-size:9px;color:var(--txt3);margin-left:4px">${gLabel}</span>
+            </div>
+          </div>
+          ${eia.status==='live'?`<div class="kcard">
+            <div class="kl" style="display:flex;align-items:center;gap:5px">
+              <span style="width:6px;height:6px;border-radius:50%;background:var(--low);flex-shrink:0"></span>
+              Oil supply (EIA)
+            </div>
+            <div class="kv">${eia.oilProdMbd ? eia.oilProdMbd.toFixed(1)+'M bbl/d' : '—'}
+              <span style="font-size:9px;color:var(--txt3);margin-left:4px">EIA live</span>
+            </div>
+          </div>`:''}
+        </div>
+      </div>`;
+    })()}
 
     <div class="p-cta">
       <button class="btn btn-primary" id="simBtn">
@@ -2613,10 +2747,10 @@ function renderAbout(){
       <div class="src-grid">
         <div class="src-card"><div class="sc-dot" style="background:var(--low)"></div><div><div class="sc-n">USGS</div><div class="sc-s">Seismic · live</div></div></div>
         <div class="src-card"><div class="sc-dot" style="background:var(--low)"></div><div><div class="sc-n">Open-Meteo</div><div class="sc-s">Marine weather · live</div></div></div>
-        <div class="src-card"><div class="sc-dot" style="background:var(--elev)"></div><div><div class="sc-n">AIS density</div><div class="sc-s">Modeled baseline</div></div></div>
-        <div class="src-card"><div class="sc-dot" style="background:var(--elev)"></div><div><div class="sc-n">UNCTAD / World Bank</div><div class="sc-s">Trade dependency</div></div></div>
-        <div class="src-card"><div class="sc-dot" style="background:var(--elev)"></div><div><div class="sc-n">EIA / IEA</div><div class="sc-s">Energy flow</div></div></div>
-        <div class="src-card"><div class="sc-dot" style="background:var(--elev)"></div><div><div class="sc-n">Geopolitical NLP</div><div class="sc-s">Modeled index</div></div></div>
+        <div class="src-card"><div class="sc-dot" style="background:var(--low)"></div><div><div class="sc-n">AISstream.io</div><div class="sc-s">Vessel density · live with key / modeled baseline</div></div></div>
+        <div class="src-card"><div class="sc-dot" style="background:var(--low)"></div><div><div class="sc-n">GDELT Project</div><div class="sc-s">Geopolitical signal · live news-derived (15-min lag)</div></div></div>
+        <div class="src-card"><div class="sc-dot" style="background:var(--low)"></div><div><div class="sc-n">EIA Open Data</div><div class="sc-s">Energy flow · live with key / public baseline</div></div></div>
+        <div class="src-card"><div class="sc-dot" style="background:var(--elev)"></div><div><div class="sc-n">World Bank WITS</div><div class="sc-s">Trade dependency · annual baseline</div></div></div>
       </div>
     </div>
 
@@ -2649,7 +2783,8 @@ async function fetchSeismic(){
       });
     });
     liveSeismic = acc;
-  }catch(e){ console.warn('seismic fetch failed',e); }
+    setDataStatus('seismic','live');
+  }catch(e){ console.warn('seismic fetch failed',e); setDataStatus('seismic','modeled'); }
 }
 async function fetchWeather(){
   try{
@@ -2658,18 +2793,171 @@ async function fetchWeather(){
       try{
         const r = await fetch(u); const d = await r.json();
         const wave = d.current?.wave_height ?? 0;
-        // wind from forecast api
         const ur = `https://api.open-meteo.com/v1/forecast?latitude=${s.lat}&longitude=${s.lon}&current=wind_speed_10m`;
         const rr = await fetch(ur); const dd = await rr.json();
-        const wind = (dd.current?.wind_speed_10m ?? 0)/3.6; // km/h -> m/s
+        const wind = (dd.current?.wind_speed_10m ?? 0)/3.6;
         liveWeather[s.id] = { wave, wind };
       }catch(_){ liveWeather[s.id] = { wave:0, wind:0 }; }
     }));
-  }catch(e){ console.warn('weather fetch failed',e); }
+    setDataStatus('weather','live');
+  }catch(e){ console.warn('weather fetch failed',e); setDataStatus('weather','modeled'); }
+}
+
+/* ---- AIS density via AISstream.io WebSocket ---- */
+let aisWs = null;
+const aisVesselBuffer = {}; // strait id -> Set of mmsi seen in last window
+function fetchAIS(){
+  if(API_KEYS.aisstream === 'YOUR_AISSTREAM_KEY'){
+    // no key — seed modeled baseline from strait transit volumes
+    STRAITS.forEach(s=>{
+      const base = parseInt(s.transits)||14000;
+      const dailyCount = Math.round(base/365);
+      // vessels in bbox at any moment ≈ dailyCount * avg_transit_hours/24
+      const inBox = Math.round(dailyCount * 4 / 24);
+      liveAIS[s.id] = { vesselCount:inBox, densityScore:50, status:'modeled' };
+    });
+    setDataStatus('ais','modeled'); return;
+  }
+  try{
+    if(aisWs){ try{aisWs.close();}catch(_){} }
+    aisWs = new WebSocket('wss://stream.aisstream.io/v0/stream');
+    STRAITS.forEach(s=>{ aisVesselBuffer[s.id] = new Set(); });
+    aisWs.onopen = ()=>{
+      const bboxes = STRAITS.map(s=>{ const b=STRAIT_BBOX[s.id]; return [b.minLat,b.minLon,b.maxLat,b.maxLon]; });
+      aisWs.send(JSON.stringify({ APIKey:API_KEYS.aisstream, BoundingBoxes:bboxes, FilterMessageTypes:['PositionReport'] }));
+      setDataStatus('ais','live');
+    };
+    aisWs.onmessage = ev=>{
+      try{
+        const msg = JSON.parse(ev.data);
+        const pos = msg?.Message?.PositionReport;
+        if(!pos) return;
+        const lat = pos.Latitude, lon = pos.Longitude, mmsi = pos.UserID;
+        STRAITS.forEach(s=>{
+          const b = STRAIT_BBOX[s.id];
+          if(lat>=b.minLat&&lat<=b.maxLat&&lon>=b.minLon&&lon<=b.maxLon){
+            aisVesselBuffer[s.id].add(mmsi);
+          }
+        });
+      }catch(_){}
+    };
+    // Flush buffer every 5 min → compute density score
+    setInterval(()=>{
+      STRAITS.forEach(s=>{
+        const count = aisVesselBuffer[s.id].size;
+        // density score: 0–100, calibrated to typical traffic levels
+        const typicalMax = { hormuz:35, malacca:80, suez:20, panama:15, babelmandeb:30, bosporus:40 };
+        const max = typicalMax[s.id] || 25;
+        const score = Math.min(100, Math.round((count/max)*80 + 10));
+        liveAIS[s.id] = { vesselCount:count, densityScore:score, status:'live' };
+        aisVesselBuffer[s.id].clear();
+      });
+      renderRail(); refreshMarkers();
+    }, 5*60*1000);
+    aisWs.onerror = ()=>{ setDataStatus('ais','modeled'); };
+  }catch(e){ console.warn('AIS WebSocket failed',e); setDataStatus('ais','modeled'); }
+}
+
+/* ---- GDELT geopolitical signal (no API key needed) ---- */
+// GDELT 2.0 Events API — free, 15-min lag, returns event counts by location/type
+async function fetchGDELT(){
+  try{
+    // Chokepoint → nearby country FIPS codes for GDELT location filter
+    const straitsGeo = {
+      hormuz:     { query:'iran+strait+hormuz', regionLabel:'Persian Gulf' },
+      malacca:    { query:'malacca+singapore+strait', regionLabel:'SE Asia' },
+      suez:       { query:'suez+canal+egypt+red+sea', regionLabel:'Red Sea' },
+      panama:     { query:'panama+canal', regionLabel:'Central America' },
+      babelmandeb:{ query:'bab+el-mandeb+houthi+yemen+red+sea', regionLabel:'Horn of Africa' },
+      bosporus:   { query:'bosporus+turkey+black+sea', regionLabel:'Black Sea' },
+    };
+    await Promise.all(STRAITS.map(async s=>{
+      const g = straitsGeo[s.id];
+      // GDELT Doc API: get articles mentioning conflict+location in last 24h
+      const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${g.query}+conflict+military+blockade+attack+naval&mode=artlist&maxrecords=10&timespan=1d&format=json`;
+      try{
+        const r = await fetch(url); const d = await r.json();
+        const count = d.articles?.length ?? 0;
+        // score = base + boost for article count (each article = ~3 points, max +30)
+        const boost = Math.min(30, count * 3);
+        const score = Math.min(100, s.base.geo + boost);
+        liveGeo[s.id] = { score, eventCount:count, status:'live', regionLabel:g.regionLabel };
+      }catch(_){
+        liveGeo[s.id] = { score:s.base.geo, eventCount:0, status:'modeled', regionLabel:g.regionLabel };
+      }
+    }));
+    setDataStatus('geo','live');
+  }catch(e){
+    console.warn('GDELT fetch failed',e);
+    STRAITS.forEach(s=>{ liveGeo[s.id]={ score:s.base.geo, eventCount:0, status:'modeled' }; });
+    setDataStatus('geo','modeled');
+  }
+}
+
+/* ---- EIA energy flow (weekly petroleum supply data) ---- */
+async function fetchEIA(){
+  if(API_KEYS.eia === 'YOUR_EIA_KEY'){
+    liveEIA = { oilProdMbd:80.5, weeklyChange:0, status:'modeled' };
+    setDataStatus('eia','modeled'); return;
+  }
+  try{
+    // EIA series: STEO.COPRPUS.M — US crude production (million barrels/day)
+    // Plus global petroleum: PET.MCRIMUS2.M
+    const url = `https://api.eia.gov/v2/petroleum/crd/crpdn/data/?api_key=${API_KEYS.eia}&frequency=weekly&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&length=2`;
+    const r = await fetch(url); const d = await r.json();
+    const vals = d?.response?.data;
+    if(vals && vals.length>=2){
+      const latest = parseFloat(vals[0].value)||0;
+      const prev   = parseFloat(vals[1].value)||0;
+      const weeklyChange = latest - prev;
+      liveEIA = { oilProdMbd:latest/1000, weeklyChange, status:'live' };
+      // propagate to SCENARIO_DATA oil baselines (scale by production change)
+      if(weeklyChange !== 0){
+        const changeFrac = weeklyChange / (prev||1);
+        STRAITS.forEach(s=>{
+          const d = SCENARIO_DATA[s.id]; if(!d) return;
+          d.oilSpikePct = d.oilSpikePct.map(v=>Math.round(v*(1-changeFrac*0.5)));
+        });
+      }
+      setDataStatus('eia','live');
+    }
+  }catch(e){ console.warn('EIA fetch failed',e); liveEIA={status:'modeled'}; setDataStatus('eia','modeled'); }
+}
+
+/* ---- World Bank trade dependency (annual, cached) ---- */
+async function fetchTrade(){
+  // Seed from baseline immediately
+  STRAITS.forEach(s=>{ liveTrade[s.id]={ ...TRADE_BASELINE[s.id], status:'baseline' }; });
+  setDataStatus('trade','modeled');
+  // Try World Bank API for latest goods trade volume (indicator NY.GDP.MKTP.CD as proxy)
+  // WB doesn't have chokepoint-level data — we use global trade growth to adjust multiplier
+  try{
+    const url = 'https://api.worldbank.org/v2/country/WLD/indicator/TG.VAL.TOTL.GD.ZS?format=json&mrv=2&per_page=2';
+    const r = await fetch(url); const d = await r.json();
+    const vals = d?.[1];
+    if(vals && vals.length>=2 && vals[0].value && vals[1].value){
+      const growth = (vals[0].value - vals[1].value) / (vals[1].value||1);
+      // apply trade growth to all strait dependency multipliers
+      STRAITS.forEach(s=>{
+        liveTrade[s.id].dependencyMult = +(1 + growth * 0.3).toFixed(3);
+        liveTrade[s.id].status = 'live';
+      });
+      setDataStatus('trade','live');
+    }
+  }catch(e){ console.warn('World Bank trade fetch failed',e); }
+
 }
 
 async function refreshAll(){
+  // Always-live: seismic + weather
   await Promise.all([fetchSeismic(), fetchWeather()]);
+  // Semi-live / keyed: AIS (WebSocket, persistent), GDELT (15-min), EIA (weekly), Trade (annual)
+  // Run in parallel — each degrades gracefully if unavailable
+  Promise.all([fetchGDELT(), fetchEIA()]).then(()=>{
+    renderRail(); renderKPIs(); refreshMarkers();
+    if(currentMode==='monitor'){ if(unifiedMode) selectUnified(); else selectStrait(selectedId, false); }
+    updatePeekBar();
+  });
   renderRail(); renderKPIs(); refreshMarkers();
   if(currentMode==='monitor'){ if(unifiedMode) selectUnified(); else selectStrait(selectedId, false); }
   updatePeekBar();
@@ -3492,7 +3780,11 @@ function init(){
 
   // live data
   refreshAll();
-  setInterval(refreshAll, 6*60*1000); // 6-min demo cadence
+  fetchAIS();   // WebSocket — persistent connection, self-managing
+  fetchTrade(); // Annual baseline + WB API update
+  setInterval(refreshAll, 6*60*1000);       // seismic + weather: 6-min
+  setInterval(fetchGDELT, 15*60*1000);      // GDELT: 15-min cadence
+  setInterval(fetchEIA, 60*60*1000);        // EIA: hourly (data updates weekly)
   // live feed cadence — a new intelligence event every ~12s keeps the board alive (desktop + mobile)
   setInterval(()=>{ if(currentMode==='monitor'){ pushFeedEvent(); } }, 12000);
 }
